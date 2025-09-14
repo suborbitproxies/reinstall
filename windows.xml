@@ -100,21 +100,22 @@
                 <RunSynchronousCommand wcm:action="add">
                     <Order>6</Order>
                     <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager /v ShippedWithReserves /t REG_DWORD /d 0 /f</Path>
-                    <!-- 此时以下命令无效 -->
-                    <!-- <Path>DISM /Online /Set-ReservedStorageState /State:Disabled</Path> -->
-                    <!-- <Path>powershell "Set-WindowsReservedStorageState -State Disabled; exit"</Path> -->
                 </RunSynchronousCommand>
-                <!-- win7 在此阶段找不到网卡 -->
-                <!-- <RunSynchronousCommand wcm:action="add">
-                    <Order>5</Order>
-                    <Path>cmd /c "if exist %SystemDrive%\windows-resize.bat (call %SystemDrive%\windows-resize.bat)"</Path>
-                </RunSynchronousCommand>
+
+                <!-- Fix boot order to put PXE first -->
                 <RunSynchronousCommand wcm:action="add">
-                    <Order>6</Order>
-                    <Path>cmd /c "if exist %SystemDrive%\windows-set-netconf.bat (call %SystemDrive%\windows-set-netconf.bat)"</Path>
-                </RunSynchronousCommand> -->
+                    <Order>7</Order>
+                    <Path>powershell -Command "$b=$((bcdedit /enum firmware) -join &#39;`n&#39;) -split &#39;`r?`n&#39; | Where-Object { $_ -match &#39;identifier\s+\{[^\}]+\}&#39; -or $_ -match &#39;description\s+UEFI: PXE&#39; }; $pxe=($b -join &#39;`n&#39;) -split &#39;identifier\s+&#39; | Where-Object { $_ -match &#39;description\s+UEFI: PXE&#39; }; $id=&quot;{&quot;+($pxe[0] -split &#39;[\{\}]&#39;)[1]+&quot;}&quot;; bcdedit /set {fwbootmgr} displayorder $id {bootmgr}"</Path>
+                </RunSynchronousCommand>
+
+                <!-- Disable Administrator lockout -->
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>8</Order>
+                    <Path>net accounts /lockoutthreshold:0</Path>
+                </RunSynchronousCommand>
             </RunSynchronous>
         </component>
+
         <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="%arch%" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <fDenyTSConnections>false</fDenyTSConnections>
         </component>
