@@ -105,7 +105,7 @@
                 <!-- Fix boot order to put PXE first -->
                 <RunSynchronousCommand wcm:action="add">
                     <Order>7</Order>
-                    <Path>powershell -Command "$b=$((bcdedit /enum firmware) -join &#39;`n&#39;) -split &#39;`r?`n&#39; | Where-Object { $_ -match &#39;identifier\s+\{[^\}]+\}&#39; -or $_ -match &#39;description\s+UEFI: PXE&#39; }; $pxe=($b -join &#39;`n&#39;) -split &#39;identifier\s+&#39; | Where-Object { $_ -match &#39;description\s+UEFI: PXE&#39; }; $id=&quot;{&quot;+($pxe[0] -split &#39;[\{\}]&#39;)[1]+&quot;}&quot;; bcdedit /set {fwbootmgr} displayorder $id {bootmgr}"</Path>
+                    <Path>powershell -Command "$bcd = bcdedit /enum firmware; $pxe = $null; for ($i=0; $i -lt $bcd.Length; $i++) { if ($bcd[$i] -match &quot;description\s+UEFI: PXE&quot;) { $pxe = ($bcd[$i - 1] -split '\s+')[1] } }; if ($pxe) { cmd /c &quot;bcdedit /set {fwbootmgr} displayorder $pxe {bootmgr}&quot; } else { Write-Error 'PXE boot entry not found.' }"</Path>
                 </RunSynchronousCommand>
 
                 <!-- Disable Administrator lockout -->
@@ -165,3 +165,4 @@
         </component>
     </settings>
 </unattend>
+
