@@ -156,7 +156,7 @@
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
-                    <CommandLine>cmd /c "echo $bcd = bcdedit /enum firmware; $pxe = $null; for ($i=0; $i -lt $bcd.Length; $i++) { if ($bcd[$i] -match 'description\s+UEFI: PXE') { $pxe = ($bcd[$i - 1] -split '\s+')[1] } }; if ($pxe) { bcdedit /set {fwbootmgr} displayorder $pxe {bootmgr} } else { Write-Error 'PXE boot entry not found.' } > C:\Set-BootOrder.ps1"</CommandLine>
+                    <CommandLine>cmd /c "echo try { Write-Host 'Starting boot order configuration...'; $bcd = bcdedit /enum firmware; $pxe = $null; foreach ($line in $bcd) { if ($line -match 'identifier\s+(.+)') { $currentId = $matches[1] } elseif ($line -match 'description\s+UEFI.*PXE' -and $currentId) { $pxe = $currentId; break } }; if ($pxe) { Write-Host 'Found PXE entry:' $pxe; bcdedit /set '{fwbootmgr}' displayorder $pxe '{bootmgr}' } else { Write-Host 'PXE boot entry not found in firmware entries' } } catch { Write-Host 'Error setting boot order:' $_.Exception.Message } > C:\Set-BootOrder.ps1"</CommandLine>
                     <Description>Create PXE Boot Order Script</Description>
                 </SynchronousCommand>
                 <SynchronousCommand wcm:action="add">
@@ -170,6 +170,7 @@
         </component>
     </settings>
 </unattend>
+
 
 
 
