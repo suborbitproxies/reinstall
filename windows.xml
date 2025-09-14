@@ -102,15 +102,20 @@
                     <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager /v ShippedWithReserves /t REG_DWORD /d 0 /f</Path>
                 </RunSynchronousCommand>
 
-                <!-- Fix boot order to put PXE first -->
                 <RunSynchronousCommand wcm:action="add">
                     <Order>7</Order>
-                    <Path>powershell -Command "$bcd = bcdedit /enum firmware; $pxe = $null; for ($i=0; $i -lt $bcd.Length; $i++) { if ($bcd[$i] -match &quot;description\s+UEFI: PXE&quot;) { $pxe = ($bcd[$i - 1] -split '\s+')[1] } }; if ($pxe) { cmd /c &quot;bcdedit /set {fwbootmgr} displayorder $pxe {bootmgr}&quot; } else { Write-Error 'PXE boot entry not found.' }"</Path>
+                    <Path>cmd /c "echo $bcd = bcdedit /enum firmware; $pxe = $null; for ($i=0; $i -lt $bcd.Length; $i++) { if ($bcd[$i] -match 'description\s+UEFI: PXE') { $pxe = ($bcd[$i - 1] -split '\s+')[1] } }; if ($pxe) { bcdedit /set {fwbootmgr} displayorder $pxe {bootmgr} } else { Write-Error 'PXE boot entry not found.' } > C:\Set-BootOrder.ps1"</Path>
+                    <Description>Create PXE Boot Order Script</Description>
                 </RunSynchronousCommand>
 
-                <!-- Disable Administrator lockout -->
                 <RunSynchronousCommand wcm:action="add">
                     <Order>8</Order>
+                    <Path>powershell.exe -ExecutionPolicy Bypass -File C:\Set-BootOrder.ps1</Path>
+                    <Description>Run PXE Boot Order Script</Description>
+                </RunSynchronousCommand>
+
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>9</Order>
                     <Path>net accounts /lockoutthreshold:0</Path>
                 </RunSynchronousCommand>
             </RunSynchronous>
@@ -165,4 +170,5 @@
         </component>
     </settings>
 </unattend>
+
 
