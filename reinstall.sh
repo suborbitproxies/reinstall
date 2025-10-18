@@ -2716,12 +2716,12 @@ add_efi_entry_in_linux() {
     install_pkg efibootmgr
 
     for efi_part in $(get_maybe_efi_dirs_in_linux); do
-        if find $efi_part -iname "*.efi" >/dev/null; then
+        if find "$efi_part" -iname "*.efi" >/dev/null; then
             dist_dir=$efi_part/EFI/reinstall
-            basename=$(basename $source)
-            mkdir -p $dist_dir
+            basename=$(basename "$source")
+            mkdir -p "$dist_dir"
 
-            if [[ "$source" = http* ]]; then
+            if [[ "$source" == http* ]]; then
                 curl -Lo "$dist_dir/$basename" "$source"
             else
                 cp -f "$source" "$dist_dir/$basename"
@@ -2732,24 +2732,39 @@ add_efi_entry_in_linux() {
                 dev_part="$("$grub_probe" -t device "$dist_dir")"
             else
                 install_pkg findmnt
-                # arch findmnt 会得到
-                # systemd-1
-                # /dev/sda2
                 dev_part=$(findmnt -T "$dist_dir" -no SOURCE | grep '^/dev/')
             fi
 
-            id=$(efibootmgr --create-only \
-                --disk "/dev/$(get_disk_by_part $dev_part)" \
-                --part "$(get_part_num_by_part $dev_part)" \
+            boot_entry_output=$(efibootmgr --create-only \
+                --disk "/dev/$(get_disk_by_part "$dev_part")" \
+                --part "$(get_part_num_by_part "$dev_part")" \
                 --label "$(get_entry_name)" \
-                --loader "\\EFI\\reinstall\\$basename" |
-                grep_efi_entry | tail -1 | grep_efi_index)
+                --loader "\\EFI\\reinstall\\$basename")
+
+            id=$(echo "$boot_entry_output" | grep_efi_entry | tail -1 | grep_efi_index)
+
+            if [[ -z "$id" ]]; then
+                error_and_exit "Failed to create EFI boot entry."
+            fi
+
+            # Set the newly created entry as first in boot order
+            current_order=$(efibootmgr | grep BootOrder | cut -d: -f2 | tr -d ' ')
+            new_order="$id"
+
+            for entry in ${current_order//,/ }; do
+                [[ "$entry" != "$id" ]] && new_order+=",${entry}"
+            done
+
+            efibootmgr --bootorder $new_order
+
+            # Optional: also set --bootnext
             efibootmgr --bootnext $id
+
             return
         fi
     done
 
-    error_and_exit "Can't find efi partition."
+    error_and_exit "Can't find EFI partition."
 }
 
 get_grub_efi_filename() {
