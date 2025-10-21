@@ -218,6 +218,18 @@ if "%EnableEMS%"=="1" (
     set EMS=/EMSPort:COM1 /EMSBaudRate:115200
 )
 
+rem Clean up reinstall EFI boot entry to avoid boot order conflicts
+for /f "tokens=1,2 delims= " %%a in ('bcdedit /enum firmware ^| findstr /C:"reinstall"') do (
+    if "%%a"=="identifier" (
+        set "reinstall_id=%%b"
+    )
+)
+
+if defined reinstall_id (
+    echo Removing reinstall EFI entry: %reinstall_id%
+    bcdedit /delete %reinstall_id%
+)
+
 echo on
 %setup% %ResizeRecoveryPartition% %EMS% %Unattended%
 exit /b
