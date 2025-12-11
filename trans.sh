@@ -209,7 +209,7 @@ download() {
 
     # -o 设置 http 下载文件名
     # -O 设置 bt 首个文件的文件名
-    aria2c "$url" \
+    aria2c --disable-ipv6 "$url" \
         -d "$(dirname "$path")" \
         -o "$(basename "$path")" \
         -O "1=$(basename "$path")" \
