@@ -218,30 +218,17 @@ if "%EnableEMS%"=="1" (
     set EMS=/EMSPort:COM1 /EMSBaudRate:115200
 )
 
-rem Clean up reinstall EFI boot entry to avoid boot order conflicts (findstr not available)
-setlocal EnableDelayedExpansion
-set "reinstall_id="
-set "capture_reinstall="
-for /f "tokens=1,* delims= " %%a in ('bcdedit /enum firmware') do (
-    if /i "%%a"=="description" (
-        echo %%b | find /i "reinstall" >nul
-        if not errorlevel 1 (
-            set "capture_reinstall=1"
-        ) else (
-            set "capture_reinstall="
-        )
-    ) else if /i "%%a"=="identifier" (
-        if defined capture_reinstall (
-            set "reinstall_id=%%b"
-            set "capture_reinstall="
-        )
+rem Clean up reinstall EFI boot entry to avoid boot order conflicts
+for /f "tokens=1,2 delims= " %%a in ('bcdedit /enum firmware ^| findstr /C:"reinstall"') do (
+    if "%%a"=="identifier" (
+        set "reinstall_id=%%b"
     )
 )
+
 if defined reinstall_id (
-    echo Removing reinstall EFI entry: !reinstall_id!
-    bcdedit /delete !reinstall_id!
+    echo Removing reinstall EFI entry: %reinstall_id%
+    bcdedit /delete %reinstall_id%
 )
-endlocal
 
 echo on
 %setup% %ResizeRecoveryPartition% %EMS% %Unattended%
