@@ -6004,7 +6004,7 @@ install_windows() {
             # 2016 2019 2022 2025 win10 win11
             *) case "${arch_intel}" in
                 32)
-                    echo https://downloadmirror.intel.com/849483/Wired_driver_30.0.1_${arch_intel}.zip
+                    echo https://downloadmirror.intel.com/849483/Wired_driver_30.5_${arch_intel}.zip
                     ;;
                 x64)
                     # intel 禁止了 wget 下载网页
