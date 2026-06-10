@@ -46,8 +46,24 @@ warn() {
 
 error_and_exit() {
     error "$@"
-    echo "Run '/trans.sh' to retry." >&2
-    echo "Run '/trans.sh alpine' to install Alpine Linux instead." >&2
+
+    if is_have_cmd sudo; then
+        sudo_='sudo '
+    elif is_have_cmd doas; then
+        sudo_='doas '
+    else
+        sudo_=
+    fi
+
+    echo "Run '$sudo_/trans.sh' to retry." >&2
+    echo "Run '$sudo_/trans.sh alpine' to install Alpine Linux instead." >&2
+
+    # 解除锁定，允许用户登录处理故障
+    # passwd -u "$username" >/dev/null
+
+    # 用不着，因为 alpine 锁定账户后无法登录 ssh
+    # 因此不会锁定
+
     exit 1
 }
 
@@ -148,11 +164,17 @@ retry() {
         local interval=5
     fi
 
+    local i
     for i in $(seq $max_try); do
         if "$@"; then
             return
         else
             ret=$?
+            # wget -O- | grep -m1 成功后会提前关闭管道，导致 141 错误
+            # 这是预期行为，因此需要排除
+            if [ $ret -eq 141 ]; then
+                return
+            fi
             if [ $i -ge $max_try ]; then
                 return $ret
             fi
@@ -173,9 +195,61 @@ is_magnet_link() {
     [[ "$1" = magnet:* ]]
 }
 
+create_alpine_rootfs() {
+    local os_dir=$1
+    local init_now=${2:-false}
+
+    # 复制当前系统的 /etc/apk 文件夹
+    mkdir -p "$os_dir"
+    cp -a --parents /etc/apk "$os_dir"
+    rm -f "$os_dir/etc/apk/world"
+
+    # 安装 alpine
+    apk add --root "$os_dir" --initdb \
+        alpine-base openssl ca-certificates
+
+    if $init_now; then
+        cp_resolv_conf "$os_dir"
+        mount_pseudo_fs "$os_dir"
+    fi
+}
+
+download_via_browser() {
+    local url=$1
+    local path=$2
+
+    local os_dir=/os/alpine_for_browser
+    mkdir_clear "$os_dir"
+
+    # 安装 chromium-headless-shell npm 到硬盘，减少内存占用
+    create_alpine_rootfs "$os_dir" true
+    apk add --root "$os_dir" chromium-headless-shell npm
+
+    # 安装 playwright
+    # shellcheck disable=SC2046
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+        chroot "$os_dir" \
+        npm install \
+        --no-save --no-package-lock \
+        --prefix "/work" \
+        $(is_in_china && echo '--registry=https://registry.npmmirror.com') \
+        playwright
+
+    # 下载文件
+    # shellcheck disable=SC2154
+    wget "$confhome/download-via-browser.js" -O "$os_dir/work/download-via-browser.js"
+    retry 5 chroot "$os_dir" node /work/download-via-browser.js "$url" "/work/download_file"
+    cp "$os_dir/work/download_file" "$path"
+
+    # 清理
+    umount_pseudo_fs "$os_dir"
+    rm -rf "$os_dir"
+}
+
 download() {
-    url=$1
-    path=$2
+    local url=$1
+    local path=$2
+    local can_use_cn_mirror=${3:-false}
 
     # 有ipv4地址无ipv4网关的情况下，aria2可能会用ipv4下载，而不是ipv6
     # axel 在 lightsail 上会占用大量cpu
@@ -214,14 +288,21 @@ download() {
 
     # -o 设置 http 下载文件名
     # -O 设置 bt 首个文件的文件名
-    aria2c --disable-ipv6 "$url" \
+    set -- \
         -d "$(dirname "$path")" \
         -o "$(basename "$path")" \
         -O "1=$(basename "$path")" \
         -U curl/7.54.1
 
+    if ! aria2c --disable-ipv6 "$url" "$@" &&
+        ! { $can_use_cn_mirror && is_in_china && is_any_ipv4_has_internet &&
+            url_cn=https://files.m.daocloud.io/$(echo "$url" | sed -E 's,^https?://,,i') &&
+            aria2c --disable-ipv6 "$url_cn" "$@"; }; then
+        error_and_exit "Failed to download $url"
+    fi
+
     # opensuse 官方镜像支持 metalink
-    # aira2 无法重命名用 metalink 下载的文件
+    # aria2 无法重命名用 metalink 下载的文件
     # 需用以下方法重命名
     if head -c 1024 "$path" | grep -Fq 'urn:ietf:params:xml:ns:metalink'; then
         real_file=$(tr -d '\n' <"$path" | sed -E 's|.*<file[[:space:]]+name="([^"]*)".*|\1|')
@@ -284,9 +365,6 @@ setup_nginx() {
     wget $confhome/logviewer.html -O /logviewer.html
     wget $confhome/logviewer-nginx.conf -O /etc/nginx/http.d/default.conf
 
-    if [ -z "$web_port" ]; then
-        web_port=80
-    fi
     sed -i "s/@WEB_PORT@/$web_port/gi" /etc/nginx/http.d/default.conf
 
     # rc-service -q nginx start
@@ -301,10 +379,6 @@ setup_websocketd() {
     apk add websocketd
     wget $confhome/logviewer.html -O /tmp/index.html
     apk add coreutils
-
-    if [ -z "$web_port" ]; then
-        web_port=80
-    fi
 
     pkill websocketd || true
     # websocketd 遇到 \n 才推送，因此要转换 \r 为 \n
@@ -416,6 +490,16 @@ extract_env_from_cmdline() {
             fi
         done < <(xargs -n1 </proc/cmdline | grep "^${prefix}_" | sed "s/^${prefix}_//")
     done
+
+    # 如果空白则设置默认值
+    if [ "$distro" = windows ]; then
+        username=${username:-administrator}
+    else
+        username=${username:-root}
+    fi
+    ssh_port=${ssh_port:-22}
+    rdp_port=${rdp_port:-3389}
+    web_port=${web_port:-80}
 }
 
 ensure_service_started() {
@@ -485,7 +569,9 @@ clear_previous() {
     fi
     disconnect_qcow
     # 安装 arch 有 gpg-agent 进程驻留
-    pkill gpg-agent || true
+    killall gpg-agent || true
+    # 在 aria2c 下载时手动中止脚本，aria2c 还会在后台下载
+    killall aria2c || true
     rc-service -q --ifexists --ifstarted nix-daemon stop
     swapoff -a
     umount_all
@@ -574,6 +660,10 @@ get_password_linux_sha512() {
 
 get_password_windows_administrator_base64() {
     get_config password-windows-administrator-base64
+}
+
+get_password_windows_user_base64() {
+    get_config password-windows-user-base64
 }
 
 get_password_plaintext() {
@@ -792,7 +882,7 @@ get_windows_version_from_windows_drive() {
     # CurrentMajorVersionNumber  10
     # CurrentMinorVersionNumber   0
 
-    apk add hivex
+    apk add hivex-perl
     hive=$(find_file_ignore_case $os_dir/Windows/System32/config/SOFTWARE)
 
     get_current_version_key() {
@@ -829,7 +919,7 @@ get_windows_version_from_windows_drive() {
     fi
 
     echo "Version: $nt_ver.$build_ver.$rev_ver" >&2
-    apk del hivex
+    apk del hivex-perl
 }
 
 is_elts() {
@@ -1541,9 +1631,24 @@ install_alpine() {
     printf '\n' | chroot /os setup-ntp || true
 
     # 设置公钥
+    add_user_if_need /os
     if is_need_set_ssh_keys; then
         set_ssh_keys_and_del_password /os
     fi
+
+    # alpine 3.24+
+    # 要从 /etc/inittab 删除多余的 tty0
+    # 否则开机时 vnc 会有两个登录提示，一个是 tty0，一个是 tty1
+
+    # sed 找到 # enable login on alternative console 的行
+    # 用 N 读取下一行到当前空间
+    # 再匹配 \ntty0:
+    sed -i '
+/^# enable login on alternative console$/{
+    N
+    /\ntty0:/d
+}
+' /os/etc/inittab
 
     # 下载 fix-eth-name
     download "$confhome/fix-eth-name.sh" /os/fix-eth-name.sh
@@ -1670,6 +1775,23 @@ install_nixos() {
     export USER=root
     export HOME=/root
 
+    # 也可以用 export NIX_CONFIG 和 --option substituters https://mirror.nju.edu.cn/nix-channels/store
+    # https://help.mirrorz.org/nix-channels/
+    configure_nix_substituters() {
+        if ! is_in_china; then
+            return
+        fi
+
+        nix_conf=/etc/nix/nix.conf
+        mkdir -p "$(dirname "$nix_conf")"
+
+        if [ -f "$nix_conf" ]; then
+            sed -i '/^[[:space:]]*substituters[[:space:]]*=/d' "$nix_conf"
+        fi
+
+        echo "substituters = $mirror/store" >>"$nix_conf"
+    }
+
     case "$nix_from" in
     alpine)
         apk add nix
@@ -1678,9 +1800,7 @@ install_nixos() {
         # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/nix/APKBUILD#L125
         sed -i '/max-jobs/d' /etc/nix/nix.conf
         echo "max-jobs = $threads" >>/etc/nix/nix.conf
-        if is_in_china; then
-            echo "substituters = $mirror/store" >>/etc/nix/nix.conf
-        fi
+        configure_nix_substituters
         rc-service -q nix-daemon restart
         # 添加 nix-env 安装的软件到 PATH
         PATH="/root/.nix-profile/bin:$PATH"
@@ -1731,6 +1851,7 @@ install_nixos() {
         apk del xz
         # shellcheck source=/dev/null
         . /root/.nix-profile/etc/profile.d/nix.sh
+        configure_nix_substituters
         ;;
     esac
 
@@ -1749,6 +1870,9 @@ install_nixos() {
     # 安装 nixos-install-tools
     nix-env -iA nixpkgs.nixos-install-tools -j $threads
 
+    # 安装 nixfmt
+    nix-env -iA nixpkgs.nixfmt -j $threads
+
     # 生成配置并显示
     nixos-generate-config --root /os
     echo "Original NixOS Configuration:"
@@ -1766,23 +1890,72 @@ install_nixos() {
     fi
 
     if [ -e /os/swapfile ] && $keep_swap; then
-        nix_swap="swapDevices = [{ device = \"/swapfile\"; size = $swap_size; }];"
+        nix_swap="swapDevices = [ { device = \"/swapfile\"; size = $swap_size; } ];"
     fi
 
+    # keys
     if is_need_set_ssh_keys; then
-        nix_ssh_keys_or_PermitRootLogin="
-users.users.root.openssh.authorizedKeys.keys = [
+        nix_user_keys_fragment="
+openssh.authorizedKeys.keys = [
 $(del_comment_lines </configs/ssh_keys | del_empty_lines | quote_line | add_space 2)
 ];
 "
+    fi
+
+    # root user
+    if [ "$username" = root ]; then
+        if is_need_set_ssh_keys; then
+            nix_users="
+users.users.$username = {
+$(echo "$nix_user_keys_fragment" | add_space 2)
+};
+"
+        else
+            nix_users=""
+        fi
     else
-        nix_ssh_keys_or_PermitRootLogin='services.openssh.settings.PermitRootLogin = "yes";'
+        # normal user
+        # https://nixos.org/manual/nixos/stable/#sec-user-management
+        nix_users=$(
+            cat <<EOF
+users.users.$username = {
+  isNormalUser = true;
+  home = "/home/$username";
+  extraGroups = [
+    "wheel"
+    "networkmanager"
+  ];
+$(echo "$nix_user_keys_fragment" | add_space 2)
+};
+
+security.sudo.extraRules = [
+  { users = [ "$username" ]; commands = [ { command = "ALL"; options = [ "NOPASSWD" ]; } ]; }
+];
+EOF
+        )
     fi
 
-    if is_need_change_ssh_port; then
-        nix_ssh_ports="services.openssh.ports = [ $ssh_port ];"
-    fi
+    # openssh
+    nix_openssh="
+services.openssh = {
+  enable = true;
+$(
+        {
+            if is_need_change_ssh_port; then
+                echo "ports = [ $ssh_port ];"
+            fi
+            if is_need_set_ssh_keys; then
+                echo 'settings.PasswordAuthentication = false;'
+            fi
+            if [ "$username" = root ] && ! is_need_set_ssh_keys; then
+                echo 'settings.PermitRootLogin = "yes";'
+            fi
+        } | add_space 2
+    )
+};
+"
 
+    # frpc
     if ls /configs/frpc.* >/dev/null 2>&1; then
         nix_frpc=$(
             if false; then
@@ -1829,9 +2002,8 @@ $nix_bootloader
 $nix_swap
 $nix_substituters
 boot.kernelParams = [ $(get_ttys console= | quote_word) ];
-services.openssh.enable = true;
-$nix_ssh_keys_or_PermitRootLogin
-$nix_ssh_ports
+$nix_users
+$nix_openssh
 $nix_frpc
 $(cat /tmp/nixos_network_config.nix)
 ###################################################
@@ -1849,10 +2021,10 @@ EOF
     )
     alls="$olds"
     # https://github.com/search?q=repo%3ANixOS%2Fnixpkgs+availableKernelModules&type=code
-    for mod in ahci ata_piix uhci_hcd sr_mod nvme \
+    for mod in ahci ata_piix uhci_hcd sr_mod nvme vmd \
         virtio_pci virtio_blk virtio_scsi \
         xen_blkfront xen_scsifront \
-        hv_storvsc \
+        hv_storvsc pci_hyperv \
         vmw_pvscsi \
         mptspi; do
         if [ -d /sys/module/$mod ] && ! echo "$olds" | grep -wq "$mod"; then
@@ -1870,6 +2042,10 @@ EOF
         array \
         /os/etc/nixos/hardware-configuration.nix
 
+    # 格式化
+    nixfmt /os/etc/nixos/configuration.nix
+    nixfmt /os/etc/nixos/hardware-configuration.nix
+
     # 显示修改后的配置
     echo "Modified NixOS Configuration:"
     show_nixos_config
@@ -1879,7 +2055,7 @@ EOF
 
     # 设置密码
     if ! is_need_set_ssh_keys; then
-        echo "root:$(get_password_linux_sha512)" | nixos-enter --root /os -- \
+        printf '%s\n' "$username:$(get_password_linux_sha512)" | nixos-enter --root /os -- \
             /run/current-system/sw/bin/chpasswd -e
     fi
 
@@ -1972,6 +2148,19 @@ add_frpc_systemd_service_if_need() {
     fi
 }
 
+get_fs_of_mount_point() {
+    local mount_point=$1
+
+    if ! [ "$mount_point" = / ]; then
+        # 删除最后的若干个 /
+        mount_point=$(printf "%s" "$mount_point" | sed 's,/*$,,')
+    fi
+
+    # findmnt 要安装
+    # findmnt "$mount_point" -rno FSTYPE
+    mount | awk -v mp="$1" '$3==mp {print $5}' | grep .
+}
+
 basic_init() {
     os_dir=$1
 
@@ -2015,12 +2204,13 @@ basic_init() {
     fi
 
     # 公钥/密码
+    add_user_if_need "$os_dir"
     if is_need_set_ssh_keys; then
         set_ssh_keys_and_del_password $os_dir
+        change_ssh_conf_for_key_login $os_dir
     else
-        change_root_password $os_dir
-        allow_root_password_login $os_dir
-        allow_password_login $os_dir
+        change_user_password $os_dir
+        change_ssh_conf_for_password_login $os_dir
     fi
 
     # 下载 fix-eth-name.service
@@ -2084,14 +2274,27 @@ EOF
 
         # 安装系统
         # 要安装分区工具(包含 fsck.xxx)，用于 initramfs 检查分区数据
-        # base 包含 e2fsprogs
         pkgs="base grub openssh"
+
+        # efi fs
         if is_efi; then
             pkgs="$pkgs efibootmgr dosfstools"
         fi
+
+        # root fs
+        case $(get_fs_of_mount_point "$os_dir") in
+        xfs) pkgs="$pkgs xfsprogs" ;;
+        ext4) pkgs="$pkgs e2fsprogs" ;;
+        btrfs) pkgs="$pkgs btrfs-progs" ;;
+        esac
+
         if [ "$(uname -m)" = aarch64 ]; then
             pkgs="$pkgs archlinuxarm-keyring"
         fi
+        if ! [ "$username" = root ]; then
+            pkgs="$pkgs sudo"
+        fi
+
         pacstrap -K $os_dir $pkgs
 
         # dns
@@ -2236,26 +2439,51 @@ EOF
         rm -rf $os_dir/var/db/repos/gentoo
         chroot $os_dir emerge --sync
 
-        if [ "$(uname -m)" = x86_64 ]; then
-            # https://packages.gentoo.org/packages/sys-block/io-scheduler-udev-rules
-            chroot $os_dir emerge sys-block/io-scheduler-udev-rules
+        # 一次性安装所有包，可减少软件包重复 rebuild ?
+        local pkgs=
+
+        # https://wiki.gentoo.org/wiki/Handbook:AMD64/Installation/Tools#Filesystem_tools
+        pkgs="$pkgs sys-block/io-scheduler-udev-rules"
+
+        # efi fs
+        if is_efi; then
+            pkgs="$pkgs sys-fs/dosfstools sys-boot/efibootmgr"
         fi
 
-        if is_efi; then
-            chroot $os_dir emerge sys-fs/dosfstools
+        # root fs
+        case $(get_fs_of_mount_point "$os_dir") in
+        xfs) pkgs="$pkgs sys-fs/xfsprogs" ;;
+        ext4) pkgs="$pkgs sys-fs/e2fsprogs" ;;
+        btrfs) pkgs="$pkgs sys-fs/btrfs-progs" ;;
+        esac
+
+        # sudo
+        if ! [ "$username" = root ]; then
+            pkgs="$pkgs app-admin/sudo"
         fi
 
         # firmware + microcode
         if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
-            chroot $os_dir emerge $fw_pkgs
+            pkgs="$pkgs $fw_pkgs"
         fi
 
         # 安装 grub + 内核
-        # TODO: 先判断是否有 binpkg，有的话不修改 GRUB_PLATFORMS
         is_efi && grub_platforms="efi-64" || grub_platforms="pc"
         echo GRUB_PLATFORMS=\"$grub_platforms\" >>$os_dir/etc/portage/make.conf
         echo "sys-kernel/installkernel dracut grub" >$os_dir/etc/portage/package.use/installkernel
-        chroot $os_dir emerge sys-kernel/gentoo-kernel-bin
+
+        # 要设置 root=UUID=xxxx，否则 dracut 会报错
+        # 要注意 root=UUID=xxxx 头尾有空格
+        # https://wiki.gentoo.org/wiki/Installkernel#Install_chroot_check
+        # https://wiki.gentoo.org/wiki/Handbook:AMD64/Installation/Kernel#Chroot_detection
+        uuid=$(chroot $os_dir findmnt -rno UUID /)
+        mkdir -p $os_dir/etc/dracut.conf.d
+        echo "kernel_cmdline=\" root=UUID=$uuid \"" >$os_dir/etc/dracut.conf.d/00-installkernel.conf
+        pkgs="$pkgs sys-kernel/gentoo-kernel-bin"
+
+        # 安装
+        # 不添加 -n/--noreplace 的话会 rebuild 选定的包，无论是否已安装
+        chroot "$os_dir" emerge -n $pkgs
     }
 
     install_aosc() {
@@ -3086,10 +3314,10 @@ get_image_state() {
         image_state=$(grep -i '^ImageState=' $state_ini | cut -d= -f2 | tr -d '\r')
     fi
     if [ -z "$image_state" ]; then
-        apk add hivex
+        apk add hivex-perl
         hive=$(find_file_ignore_case $os_dir/Windows/System32/config/SOFTWARE)
         image_state=$(hivexget $hive '\Microsoft\Windows\CurrentVersion\Setup\State' ImageState)
-        apk del hivex
+        apk del hivex-perl
     fi
 
     if [ -n "$image_state" ]; then
@@ -3143,7 +3371,29 @@ modify_windows() {
         bats="$bats windows-set-netconf-$ethx.bat"
     done
 
-    # 5 frp
+    # 5. 设置用户密码永不过期（仅限 iso 安装）
+    #    Azure 的 Windows 实例，初始用户的密码也是永不过期的
+    #    管理员账号默认不会过期
+    if [ "$distro" = "windows" ] && ! is_administrator_username "$username"; then
+        # 两种方法都可以，但语法很神奇
+
+        # 第二行前面不能有空格
+        cat <<EOF >$os_dir/windows-set-user-password-never-expires.bat
+wmic useraccount where name="$username" set passwordexpires=false || ^
+powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Set-LocalUser -Name '$username' -PasswordNeverExpires \$true"
+del "%~f0"
+EOF
+        # 第二行 || 前面必须有空格
+        cat <<EOF >$os_dir/windows-set-user-password-never-expires.bat
+wmic useraccount where name="$username" set passwordexpires=false ^
+  || powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Set-LocalUser -Name '$username' -PasswordNeverExpires \$true"
+del "%~f0"
+EOF
+        unix2dos $os_dir/windows-set-user-password-never-expires.bat
+        bats="$bats windows-set-user-password-never-expires.bat"
+    fi
+
+    # 6. frp
     if ls /configs/frpc.* >/dev/null 2>&1; then
         if [ "$(get_windows_arch_from_windows_drive "$os_dir" | to_lower)" = x86 ]; then
             os_bit=32
@@ -3405,6 +3655,10 @@ remove_or_disable_cloud_init() {
                     rm -f $os_dir/etc/cloud/cloud.cfg.rpmsave
                     ;;
                 zypper)
+                    # 防止删除 cloud-init 时自动删除 sudo
+                    if ! [ "$username" = root ]; then
+                        sed -i '/^sudo$/d' "$os_dir/var/lib/zypp/AutoInstalled"
+                    fi
                     # 加上 -u 才会删除依赖
                     chroot $os_dir zypper remove -y -u cloud-init cloud-init-config-suse
                     ;;
@@ -3481,8 +3735,9 @@ modify_linux() {
     find_and_mount() {
         mount_point=$1
         mount_dev=$(awk "\$2==\"$mount_point\" {print \$1}" $os_dir/etc/fstab)
+        mount_opts=$(awk "\$2==\"$mount_point\" {print \$4}" $os_dir/etc/fstab)
         if [ -n "$mount_dev" ]; then
-            mount $mount_dev $os_dir$mount_point
+            mount -o "$mount_opts" "$mount_dev" "$os_dir$mount_point"
         fi
     }
 
@@ -3510,9 +3765,14 @@ EOF
         # 防止删除 cloud-init / 安装 firmware 时不够内存
         create_swap_if_ram_less_than 2048 $os_dir/swapfile
 
-        find_and_mount /boot
-        find_and_mount /boot/efi
         mount_pseudo_fs $os_dir
+
+        # find_and_mount /boot
+        # find_and_mount /boot/efi
+        # fedora 的 fstab 还有 /home /var，因此用 mount -a
+        # 不然无法往 /home/$username 写入 ssh 公钥
+        chroot $os_dir mount -a
+
         cp_resolv_conf $os_dir
 
         # 可以直接用 alpine 的 cloud-init 生成 Network Manager 配置
@@ -3729,61 +3989,11 @@ EOF
         # 禁用 selinux
         disable_selinux $os_dir
 
-        # opensuse leap 15.6 用 wicked
         # opensuse leap 16.0 / tumbleweed 用 NetworkManager
-        if chroot $os_dir rpm -qi wicked; then
-            # sysconfig ifcfg
-            create_cloud_init_network_config $os_dir/net.cfg
-            chroot $os_dir cloud-init devel net-convert \
-                -p /net.cfg -k yaml -d out -D opensuse -O sysconfig
-
-            # 删除
-            # Created by cloud-init on instance boot automatically, do not edit.
-            #
-            sed -i '/^#/d' "$os_dir/out/etc/sysconfig/network/ifcfg-eth"*
-
-            for ethx in $(get_eths); do
-                # 1. 修复甲骨文云重启后 ipv6 丢失
-                # https://github.com/openSUSE/wicked/issues/1058
-                # 还要注意 wicked dhcpv6 获取到的 ipv6 是 /64，其他 DHCPv6 程序获取到的是 /128
-                echo DHCLIENT6_USE_LAST_LEASE=no >>$os_dir/out/etc/sysconfig/network/ifcfg-$ethx
-
-                # 2. 修复 onlink 网关
-                for prefix in '' 'default '; do
-                    if is_staticv4; then
-                        get_netconf_to ipv4_gateway
-                        echo "${prefix}${ipv4_gateway} - -" >>$os_dir/out/etc/sysconfig/network/ifroute-$ethx
-                    fi
-                    if is_staticv6; then
-                        get_netconf_to ipv6_gateway
-                        echo "${prefix}${ipv6_gateway} - -" >>$os_dir/out/etc/sysconfig/network/ifroute-$ethx
-                    fi
-                done
-            done
-
-            # 复制配置
-            for file in \
-                "$os_dir/out/etc/sysconfig/network/ifcfg-eth"* \
-                "$os_dir/out/etc/sysconfig/network/ifroute-eth"*; do
-                # 动态 ip 没有 ifroute-eth*
-                if [ -f $file ]; then
-                    cp $file $os_dir/etc/sysconfig/network/
-                fi
-            done
-
-            # 清理
-            rm -rf $os_dir/net.cfg $os_dir/out
-
-        else
-            # 如果使用 cloud-init 则需要 touch NetworkManager.conf
-            # 更新到 cloud-init 24.1 后删除
-            # touch $os_dir/etc/NetworkManager/NetworkManager.conf
-
-            # 可以直接用 alpine 的 cloud-init 生成 Network Manager 配置
-            create_cloud_init_network_config /net.cfg
-            create_network_manager_config /net.cfg "$os_dir"
-            rm /net.cfg
-        fi
+        # 可以直接用 alpine 的 cloud-init 生成 Network Manager 配置
+        create_cloud_init_network_config /net.cfg
+        create_network_manager_config /net.cfg "$os_dir"
+        rm /net.cfg
 
         # 选择新内核
         # 只有 leap 有 kernel-azure
@@ -3822,7 +4032,7 @@ EOF
                 chroot $os_dir zypper remove -y --force-resolution $origin_kernel
             fi
             if $need_password_workaround; then
-                chroot $os_dir passwd -d root
+                chroot $os_dir passwd -d -l root
             fi
         fi
 
@@ -3859,10 +4069,11 @@ EOF
 
         # 在这里修改密码，而不是用cloud-init，因为我们的默认密码太弱
         is_password_plaintext && sed -i 's/enforce=everyone/enforce=none/' $os_dir/etc/security/passwdqc.conf
-        change_root_password $os_dir
+        change_user_password $os_dir
         is_password_plaintext && sed -i 's/enforce=none/enforce=everyone/' $os_dir/etc/security/passwdqc.conf
 
         # 下载仓库，选择 profile
+        # https://github.com/gentoo/gentoo/blob/master/profiles/profiles.desc
         chroot $os_dir emerge-webrsync
         profile=$(chroot $os_dir eselect profile list | grep stable | grep systemd |
             awk '{print length($2), $2}' | sort -n | head -1 | awk '{print $2}')
@@ -4043,84 +4254,347 @@ create_swap() {
     fi
 }
 
-set_ssh_keys_and_del_password() {
-    os_dir=$1
-    info 'set ssh keys'
+del_user_password_and_lock() {
+    local os_dir=$1
+    local username=$2
 
-    # 添加公钥
-    (
-        umask 077
-        mkdir -p $os_dir/root/.ssh
-        cat /configs/ssh_keys >$os_dir/root/.ssh/authorized_keys
-    )
+    # 锁定用户后 ssh 能否登录
+    # alpine ×
+    # 其它系统 √
+
+    # root 空密码，不锁定 root，其它用户用 su - root 能否切换到 root
+    # alpine ×
+    # 其它系统 √
+
+    # centos 7 不支持一行命令同时 -d -l
+    # passwd: Only one of -l, -u, -d, -S may be specified.
 
     # 删除密码
-    chroot $os_dir passwd -d root
+    chroot "$os_dir" passwd -d "$username"
+
+    # 锁定用户
+    if ! [ -e "$os_dir/etc/alpine-release" ]; then
+        chroot "$os_dir" passwd -l "$username"
+    fi
+
+    # alpine 锁定用户无法登录 ssh
+    # 因为 alpine 默认不开启 pam
+    # 其他系统默认开启
+
+    # 不开启 pam 的话，锁定用户无法登录 ssh
+    # 开启 pam 后可以
+
+    # alpine 是通过安装 openssh-server-pam 开启 pam
+    # 不需要设置 UsePAM yes 也无法识别 UsePAM yes
+    # localhost:~# sshd -G | grep -i pam
+    # /etc/ssh/sshd_config line 88: Unsupported option UsePAM
 }
 
-# 除了 alpine 都会用到
-change_ssh_conf() {
-    os_dir=$1
-    key=$2
-    value=$3
-    sub_conf=$4
+set_ssh_keys_and_del_password() {
+    local os_dir=$1
 
-    if line="^$key .*" && grep -Exq "$line" $os_dir/etc/ssh/sshd_config 2>/dev/null; then
-        # 如果 sshd_config 存在此 key（非注释状态），则替换
+    info 'set ssh keys'
+
+    if [ "$username" = root ]; then
+        local user_home="/root"
+    else
+        local user_home="/home/$username"
+    fi
+
+    # 添加公钥
+    if true; then
+        (
+            umask 077
+            mkdir -p "$os_dir/$user_home/.ssh"
+            cat /configs/ssh_keys >"$os_dir/$user_home/.ssh/authorized_keys"
+        )
+        # 注意要用 chroot，否则 uid/gid 是 alpine live os 下的 uid/gid
+        chroot "$os_dir" chown "$username:$username" "$user_home"
+        chroot "$os_dir" chown "$username:$username" "$user_home/.ssh"
+        chroot "$os_dir" chown "$username:$username" "$user_home/.ssh/authorized_keys"
+    else
+        (
+            # 如果日后添加 bsd 无法 chroot 时可以这样
+            umask 077
+            read -r owner group < \
+                <(awk -F: -v user="$username" '$1==user {print $3,$4}' "$os_dir/etc/passwd")
+            install -D \
+                -m 600 \
+                -o "$owner" \
+                -g "$group" \
+                /configs/ssh_keys \
+                "$os_dir/$user_home/.ssh/authorized_keys"
+        )
+    fi
+
+    # 删除密码/锁定用户
+    del_user_password_and_lock "$os_dir" "$username"
+
+    # debian 云镜像 /etc/shadow 的 root 条目为
+    # root:!unprovisioned:20591:0:99999:7:::
+    # 首次开机会停在设置 root 密码界面，且阻塞 ssh 服务
+    # 因此这里手动清空 root 密码并锁定
+    if ! [ "$username" = root ] && is_have_cmd_on_disk "$os_dir" systemd-firstboot; then
+        del_user_password_and_lock "$os_dir" root
+    fi
+}
+
+_is_ssh_kv_effective() {
+    local os_dir=$1
+    local key=$2
+    local value=$3
+
+    # 解决 ubuntu 22.04 报错
+    # Missing privilege separation directory: /run/sshd
+    if [ -d "$os_dir/run/sshd" ]; then
+        we_create_run_sshd_dir=false
+    else
+        we_create_run_sshd_dir=true
+        mkdir -p "$os_dir/run/sshd"
+    fi
+
+    # centos 7 / ubuntu 22.04 不支持 -G
+    if res=$(chroot "$os_dir" sshd -G 2>/dev/null || chroot "$os_dir" sshd -T 2>/dev/null); then
+        # 删除自己创建的，避免后续权限不准确
+        if $we_create_run_sshd_dir; then
+            rm -rf "$os_dir/run/sshd"
+        fi
+        printf "%s\n" "$res" | grep -Fxiq "$key $value"
+    else
+        error_and_exit "Failed to verify sshd config."
+    fi
+}
+
+is_ssh_kv_effective() {
+    local os_dir=$1
+    local key=$2
+    local value=$3
+
+    if _is_ssh_kv_effective "$os_dir" "$key" "$value"; then
+        return 0
+    fi
+
+    # centos 7 设置 prohibit-password ，sshd -T 会显示成 without-password
+    if [ "$(echo "$key" | to_lower)" = "permitrootlogin" ] && {
+        [ "$(echo "$value" | to_lower)" = "prohibit-password" ] ||
+            [ "$(echo "$value" | to_lower)" = "without-password" ]
+    }; then
+        if _is_ssh_kv_effective "$os_dir" "permitrootlogin" "prohibit-password" ||
+            _is_ssh_kv_effective "$os_dir" "permitrootlogin" "without-password"; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+change_ssh_conf_if_different() {
+    local os_dir=$1
+    local key=$2
+    local value=$3
+    local sub_conf=$4
+    if [ -z "$sub_conf" ]; then
+        sub_conf=$(echo "01-$key.conf" | to_lower)
+    fi
+
+    # 有些发行版自带了某些配置，例如
+    # ubuntu:
+    # cat /etc/ssh/sshd_config.d/60-cloudimg-settings.conf | grep -i PasswordAuthentication
+    # PasswordAuthentication no
+
+    # gentoo:
+    # cat /etc/ssh/sshd_config.d/9999999gentoo-pam.conf | grep -i PasswordAuthentication
+    # PasswordAuthentication no
+
+    # 0. 如果已经有这个配置，则不修改，避免不必要的改动
+    if is_ssh_kv_effective "$os_dir" "$key" "$value"; then
+        return
+    fi
+
+    if line="^$key .*" && grep -Exiq "$line" $os_dir/etc/ssh/sshd_config 2>/dev/null; then
+        # 1. 如果 sshd_config 存在此 key（非注释状态），则替换
         sed -Ei "s/$line/$key $value/" $os_dir/etc/ssh/sshd_config
-    elif include_line='^Include.*/etc/ssh/sshd_config.d' &&
+    elif include_line='^Include .*/etc/ssh/sshd_config.d' &&
+        # 2. 如果 sshd_config 设置了读取 sshd_config.d
+        #    则写入到 sshd_config.d/01-xxx.conf
+
         # arch 没有 /etc/ssh/sshd_config.d/ 文件夹
         # opensuse tumbleweed 没有 /etc/ssh/sshd_config
         #                       有 /etc/ssh/sshd_config.d/ 文件夹
         #                       有 /usr/etc/ssh/sshd_config
-        { grep -q "$include_line" $os_dir/etc/ssh/sshd_config ||
-            grep -q "$include_line" $os_dir/usr/etc/ssh/sshd_config; } 2>/dev/null; then
+        { grep -iq "$include_line" $os_dir/etc/ssh/sshd_config ||
+            grep -iq "$include_line" $os_dir/usr/etc/ssh/sshd_config; } 2>/dev/null; then
         mkdir -p $os_dir/etc/ssh/sshd_config.d/
         echo "$key $value" >"$os_dir/etc/ssh/sshd_config.d/$sub_conf"
     else
-        # 如果 sshd_config 存在此 key (无论是否已注释)，则替换，包括删除注释
-        # 否则追加
+        # 3. 写入 sshd_config
+        #    如果 sshd_config 存在此 key (无论是否已注释)，则替换，包括删除注释
+        #    否则追加
         line="^[# ]*$key .*"
-        if grep -Exq "$line" $os_dir/etc/ssh/sshd_config; then
+        if grep -Exiq "$line" $os_dir/etc/ssh/sshd_config; then
             sed -Ei "s/$line/$key $value/" $os_dir/etc/ssh/sshd_config
         else
             echo "$key $value" >>$os_dir/etc/ssh/sshd_config
         fi
     fi
+
+    # 验证是否成功
+    if ! is_ssh_kv_effective "$os_dir" "$key" "$value"; then
+        error_and_exit "Failed to set sshd config $key $value."
+    fi
 }
 
-allow_password_login() {
-    os_dir=$1
-    change_ssh_conf "$os_dir" PasswordAuthentication yes 01-PasswordAuthentication.conf
+change_ssh_conf_for_key_login() {
+    local os_dir=$1
+
+    change_ssh_conf_if_different "$os_dir" PasswordAuthentication no
+
+    # centos 7 PermitRootLogin 默认是 yes，而不是 prohibit-password
+    if [ "$username" = root ]; then
+        change_ssh_conf_if_different "$os_dir" PermitRootLogin prohibit-password
+    fi
 }
 
-allow_root_password_login() {
-    os_dir=$1
+change_ssh_conf_for_password_login() {
+    local os_dir=$1
 
     # opensuse 16/tumbleweed 安装 openssh-server-config-rootlogin
     # 会生成 /usr/etc/ssh/sshd_config.d/50-permit-root-login.conf
     # 但是如果用户删除了此文件，包有更新的话，可能会重新创建这个文件？
     # 因此先不用这个方法
-    if false && [ -f $os_dir/etc/os-release ] &&
-        grep -iq opensuse $os_dir/etc/os-release &&
-        ! grep -iq 15.6 $os_dir/etc/os-release; then
+    if false &&
+        [ -f $os_dir/etc/os-release ] &&
+        grep -iq opensuse $os_dir/etc/os-release; then
         chroot $os_dir zypper install -y openssh-server-config-rootlogin
-    else
-        change_ssh_conf "$os_dir" PermitRootLogin yes 01-permitrootlogin.conf
+    fi
+
+    # PasswordAuthentication 默认是 yes
+    # 但某些发行版会在 sshd_config.d 里设置 PasswordAuthentication no
+    change_ssh_conf_if_different "$os_dir" PasswordAuthentication yes
+
+    if [ "$username" = root ]; then
+        change_ssh_conf_if_different "$os_dir" PermitRootLogin yes
     fi
 }
 
 change_ssh_port() {
-    os_dir=$1
-    ssh_port=$2
+    local os_dir=$1
+    local ssh_port=$2
 
-    change_ssh_conf "$os_dir" Port "$ssh_port" 01-change-ssh-port.conf
+    change_ssh_conf_if_different "$os_dir" Port "$ssh_port"
 }
 
-change_root_password() {
-    os_dir=$1
+# 暂时用不着
+add_user_if_need_for_alpine() {
+    local os_dir=$1
 
-    info 'change root password'
+    if ! grep -q "^$username:" "$os_dir/etc/passwd"; then
+        #  -a  Create admin user. Add to wheel group and set up doas
+        #  -u  Unlock the user automatically (eg. creating the user non-interactively
+        #      with an ssh key for login)
+        if is_need_set_ssh_keys; then
+            chroot "$os_dir" setup-user -a -u -k "$(cat /configs/ssh_keys)" "$username"
+        else
+            chroot "$os_dir" setup-user -a -u "$username"
+            change_user_password $os_dir
+        fi
+    fi
+}
+
+add_user_if_need() {
+    local os_dir=$1
+
+    # 添加用户
+    if ! grep -q "^$username:" "$os_dir/etc/passwd"; then
+        # debian 推荐使用 adduser 而不是 useradd
+        # https://manpages.debian.org/trixie/passwd/useradd.8.en.html
+        # useradd is a low level utility for adding users.
+        # On Debian, administrators should usually use adduser(8) instead.
+
+        # adduser 会从 /etc/adduser.conf 读取默认要添加的组
+        # 然而通常这个值是空白
+
+        # alpine
+        if is_have_cmd_on_disk "$os_dir" adduser &&
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- BusyBox; then
+            chroot "$os_dir" adduser --disabled-password "$username"
+
+        # debian/ubuntu
+        elif is_have_cmd_on_disk "$os_dir" adduser &&
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--disabled-password'; then
+            chroot "$os_dir" adduser --disabled-password --comment '' "$username"
+
+        # el
+        elif is_have_cmd_on_disk "$os_dir" adduser &&
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--password'; then
+            chroot "$os_dir" adduser --password ! "$username"
+
+        # arch/gentoo 默认没有 adduser
+        else
+            chroot "$os_dir" useradd -m "$username"
+        fi
+    fi
+
+    # 添加到 wheel/sudo 组
+    if ! [ "$username" = root ]; then
+        if [ -e "$os_dir/etc/alpine-release" ]; then
+            # alpine
+            # https://github.com/alpinelinux/alpine-conf/blob/master/setup-user.in#L168
+
+            # 安装 doas
+            chroot "$os_dir" apk add doas doas-sudo-shim
+            mkdir -p "$os_dir/etc/doas.d"
+
+            # 添加用户到组
+            chroot "$os_dir" addgroup "$username" wheel
+
+            # doas: 添加 wheel 组
+            local file="$os_dir/etc/doas.d/20-wheel.conf"
+            local content="permit persist :wheel"
+            if ! grep -q "^$content" "$file" 2>/dev/null; then
+                echo "$content" >>"$file"
+            fi
+
+            # doas: 添加单个用户 nopass
+            echo "permit nopass $username" >"$os_dir/etc/doas.d/99-$username.conf"
+        else
+            # 通常用 wheel 组
+            # debian/ubuntu 没有 wheel 组，只有 sudo 组
+
+            # aws lightsail 上测试默认用户加入了哪些组
+            # debian       admin : admin adm dialout cdrom floppy sudo audio dip video plugdev
+            # ubuntu       ubuntu : ubuntu adm cdrom sudo dip lxd
+            # almalinux    ec2-user : ec2-user adm systemd-journal
+            # opensuse     ec2-user : ec2-user
+
+            # 添加用户到组
+            for group in \
+                wheel sudo \
+                adm dialout cdrom floppy audio dip video plugdev lxd systemd-journal; do
+                if grep -q "^$group:" "$os_dir/etc/group"; then
+                    # chroot "$os_dir" addgroup "$username" "$group"
+                    chroot "$os_dir" usermod -aG "$group" "$username"
+                fi
+            done
+
+            # sudo: gentoo 安装 sudo 后也没有 /etc/sudoers.d
+            if ! [ -d "$os_dir/etc/sudoers.d" ]; then
+                install -d -m 0750 "$os_dir/etc/sudoers.d"
+            fi
+
+            # sudo: 添加单个用户 NOPASSWD
+            # https://wiki.archlinux.org/title/Sudo#Sudoers_default_file_permissions
+            local file="$os_dir/etc/sudoers.d/99-$username"
+            printf '%s\n' "$username ALL=(ALL) NOPASSWD:ALL" >"$file"
+            chmod 0440 "$file"
+        fi
+    fi
+}
+
+change_user_password() {
+    local os_dir=$1
+
+    info 'change user password'
 
     if is_password_plaintext; then
         pam_d=$os_dir/etc/pam.d
@@ -4154,13 +4628,13 @@ change_root_password() {
 
         # 分两行写，不然遇到错误不会终止
         plaintext=$(get_password_plaintext)
-        echo "root:$plaintext" | chroot $os_dir chpasswd
+        printf '%s\n' "$username:$plaintext" | chroot $os_dir chpasswd
 
         if $has_pamd_chpasswd; then
             mv $pam_d/chpasswd.orig $pam_d/chpasswd
         fi
     else
-        echo "root:$(get_password_linux_sha512)" | chroot $os_dir chpasswd -e
+        printf '%s\n' "$username:$(get_password_linux_sha512)" | chroot $os_dir chpasswd -e
     fi
 }
 
@@ -4430,6 +4904,7 @@ chroot_apt_autoremove() {
 del_default_user() {
     os_dir=$1
 
+    local user
     while read -r user; do
         if grep ^$user':\$' "$os_dir/etc/shadow"; then
             echo "Deleting user $user"
@@ -4468,7 +4943,7 @@ EOF
 }
 
 install_fnos() {
-    info "Install fnos"
+    info "Install fnos/fygoos"
     os_dir=/os
 
     # 官方安装调用流程
@@ -4521,7 +4996,7 @@ install_fnos() {
     fi
 
     # 复制系统
-    info "Extract fnos"
+    info "Extract fnos/fygoos"
     apk add tar gzip pv
     pv -f /os/installer/trimfs.tgz | tar zxp --numeric-owner --xattrs-include='*.*' -C /os
     apk del tar gzip pv
@@ -4531,7 +5006,7 @@ install_fnos() {
 
     # 缩小分区
     if $NEED_SHRINK_FNOS_OS_PART; then
-        info "Shrink fnos os partition"
+        info "Shrink fnos/fygoos os partition"
 
         # 取消挂载
         if is_efi; then
@@ -4563,15 +5038,21 @@ install_fnos() {
     mount_pseudo_fs /os
 
     # 更改密码
-    if is_need_set_ssh_keys; then
-        set_ssh_keys_and_del_password $os_dir
-    else
-        change_root_password $os_dir
+    if false; then
+        if is_need_set_ssh_keys; then
+            set_ssh_keys_and_del_password $os_dir
+        else
+            change_user_password $os_dir
+        fi
     fi
 
     # ssh root 登录，测试用
     if false; then
-        allow_root_password_login $os_dir
+        if is_need_set_ssh_keys; then
+            change_ssh_conf_for_key_login $os_dir
+        else
+            change_ssh_conf_for_password_login $os_dir
+        fi
         chroot $os_dir systemctl enable ssh
     fi
 
@@ -4609,8 +5090,18 @@ install_fnos() {
     fi
 
     # grub 配置
-    # 取自 strings trim-install | grep GRUB_DISTRIBUTOR
-    sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="FNOS"/' $os_dir/etc/default/grub
+    # strings trim-install | grep GRUB_DISTRIBUTOR
+    # 国内版得到的是 sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="FNOS"/' /mnt/rootfs/etc/default/grub
+    # 国际版得到的是 sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="%s"/' /mnt/rootfs/etc/default/grub
+    # 因此这里写死
+    if grep -Fq fygonas.com $os_dir/etc/apt/sources.list.d/trim_repo.list; then
+        name_for_grub=FygoOS
+    elif grep -Fq fnnas.com $os_dir/etc/apt/sources.list.d/trim_repo.list; then
+        name_for_grub=FNOS
+    else
+        error_and_exit 'Can not detect FNOS/FygoOS.'
+    fi
+    sed -i "s/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR=\"$name_for_grub\"/" $os_dir/etc/default/grub
 
     # grub tty
     ttys_cmdline=$(get_ttys console=)
@@ -5011,11 +5502,15 @@ EOF
         fi
 
         # 自带的 60-cloudimg-settings.conf 禁止了 PasswordAuthentication
-        file=$os_dir/etc/ssh/sshd_config.d/60-cloudimg-settings.conf
-        if [ -f $file ]; then
-            sed -i '/^PasswordAuthentication/d' $file
-            if [ -z "$(cat $file)" ]; then
-                rm -f $file
+        # 可删除可不删除，因为现在会先读取有效 sshd 配置再修改 sshd 配置
+        # 如果要删除 60-cloudimg-settings.conf 则要在 change_ssh_conf_if_different 之前删除
+        if false; then
+            file=$os_dir/etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+            if [ -f $file ]; then
+                sed -i '/^PasswordAuthentication/d' $file
+                if [ -z "$(cat $file)" ]; then
+                    rm -f $file
+                fi
             fi
         fi
 
@@ -5656,49 +6151,58 @@ get_aws_repo() {
     fi
 }
 
-get_client_name_by_build_ver() {
-    build_ver=$1
-
-    if [ "$build_ver" -ge 22000 ]; then
-        echo 11
-    elif [ "$build_ver" -ge 10240 ]; then
-        echo 10
-    elif [ "$build_ver" -ge 9600 ]; then
-        echo 8.1
-    elif [ "$build_ver" -ge 9200 ]; then
-        echo 8
-    elif [ "$build_ver" -ge 7600 ]; then
-        echo 7
-    elif [ "$build_ver" -ge 6000 ]; then
-        echo vista
-    else
-        error_and_exit "Unknown Build Version: $build_ver"
-    fi
-}
-
 # 将 AC/SAC 版本号 转换为 LTSC 版本号
 # 用于查找驱动
-get_server_name_by_build_ver() {
-    build_ver=$1
+get_windows_name_by_version() {
+    local nt_ver=$1
+    local build_ver=$2
+    local windows_type=$3
 
-    if [ "$build_ver" -ge 26100 ]; then
-        echo 2025
-    elif [ "$build_ver" -ge 20348 ]; then
-        echo 2022
-    elif [ "$build_ver" -ge 17763 ]; then
-        echo 2019
-    elif [ "$build_ver" -ge 14393 ]; then
-        echo 2016
-    elif [ "$build_ver" -ge 9600 ]; then
-        echo 2012 r2
-    elif [ "$build_ver" -ge 9200 ]; then
-        echo 2012
-    elif [ "$build_ver" -ge 7600 ]; then
-        echo 2008 r2
-    elif [ "$build_ver" -ge 6001 ]; then
-        echo 2008
+    local windows_name
+    windows_name=$(
+        case "$windows_type" in
+        client)
+            case "$nt_ver" in
+            10.0)
+                if [ "$build_ver" -ge 22000 ]; then
+                    echo 11
+                else
+                    echo 10
+                fi
+                ;;
+            6.3) echo 8.1 ;;
+            6.2) echo 8 ;;
+            6.1) echo 7 ;;
+            6.0) echo vista ;;
+            esac
+            ;;
+
+        server)
+            case "$nt_ver" in
+            10.0)
+                if [ "$build_ver" -ge 26100 ]; then
+                    echo 2025
+                elif [ "$build_ver" -ge 20348 ]; then
+                    echo 2022
+                elif [ "$build_ver" -ge 17763 ]; then
+                    echo 2019
+                else
+                    echo 2016
+                fi
+                ;;
+            6.3) echo '2012 r2' ;;
+            6.2) echo '2012' ;;
+            6.1) echo '2008 r2' ;;
+            6.0) echo '2008' ;;
+            esac
+            ;;
+        esac
+    )
+
+    if [ -n "$windows_name" ]; then
+        echo "$windows_name"
     else
-        error_and_exit "Unknown Build Version: $build_ver"
+        error_and_exit "Unknown Windows Version: $nt_ver $build_ver $windows_type"
     fi
 }
 
@@ -5707,6 +6211,26 @@ is_nt_ver_ge() {
     orig=$(printf '%s\n' "$1" "$nt_ver")
     sorted=$(echo "$orig" | sort -V)
     [ "$orig" = "$sorted" ]
+}
+
+# reinstall.sh 有同名方法
+is_administrator_username() {
+    username_in_lower=$(printf "%s" "$1" | to_lower)
+
+    for builtin_username in \
+        administrator \
+        administrador \
+        administrateur \
+        administratör \
+        администратор \
+        järjestelmänvalvoja \
+        rendszergazda; do
+        if [ "$username_in_lower" = "$builtin_username" ]; then
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 get_cloud_vendor() {
@@ -5785,36 +6309,37 @@ get_drivers() {
 get_windows_type_from_windows_drive() {
     local os_dir=$1
 
-    apk add hivex
-    software_hive=$(find_file_ignore_case $os_dir/Windows/System32/config/SOFTWARE)
+    apk add hivex-perl
     system_hive=$(find_file_ignore_case $os_dir/Windows/System32/config/SYSTEM)
-    installation_type=$(hivexget $software_hive '\Microsoft\Windows NT\CurrentVersion' InstallationType 2>/dev/null || true)
-    product_type=$(hivexget $system_hive '\ControlSet001\Control\ProductOptions' ProductType 2>/dev/null || true)
-    apk del hivex
+    product_type=$(hivexget $system_hive '\ControlSet001\Control\ProductOptions' ProductType)
+    apk del hivex-perl
 
-    # 根据 win11 multi-session 的情况
-    # InstallationType 比 ProductType 准确
+    # ProductType InstallationType 都是用来区分客户端和服务器系统
+    # 就驱动而言，用的是 ProductType
+    # https://learn.microsoft.com/windows-hardware/drivers/install/inf-manufacturer-section
+    # NTamd64.10.0       # 不限制 ProductType
+    # NTamd64.10.0.1     # 只接受 ProductType 为 1 的系统
 
-    # Vista wim 和注册表都没有 InstallationType
-    case "$installation_type" in
-    Client | Embedded) echo client ;;
-    Server | 'Server Core') echo server ;;
-    *) case "$product_type" in
-        WinNT) echo client ;;
-        ServerNT) echo server ;;
-        *) error_and_exit "Unknown Windows Type" ;;
-        esac ;;
+    # 实测也是用 ProductType
+    # 在 win11 右键 e1d.inf 安装驱动后，在任务管理器强制为任意网卡选择驱动，列表里面：
+    # win11 enterprise    有   i218-V/i-219V，有 i218-LM/i219-LM
+    # win11 multi-session 没有 i218-V/i-219V，有 i218-LM/i219-LM
+
+    case "$product_type" in
+    WinNT) echo client ;;
+    LanmanNT | ServerNT) echo server ;;
+    *) error_and_exit "Unexpected Product Type: $product_type" ;;
     esac
 }
 
 get_windows_arch_from_windows_drive() {
     local os_dir=$1
 
-    apk add hivex
+    apk add hivex-perl
     hive=$(find_file_ignore_case $os_dir/Windows/System32/config/SYSTEM)
     # 没有 CurrentControlSet
     hivexget $hive 'ControlSet001\Control\Session Manager\Environment' PROCESSOR_ARCHITECTURE
-    apk del hivex
+    apk del hivex-perl
 }
 
 get_intel_download_url() {
@@ -5831,6 +6356,21 @@ get_intel_download_url() {
     # intel 禁止了 wget 下载网页
     wget -U curl/7.54.1 "$url" -O- | sed 's,",\n,g' |
         grep -Eio -m1 "https://.+/$file_regex" | grep .
+}
+
+apk_add_from_edge() {
+    # 从 edge/community 仓库下载新版软件包
+    # 现在用不到
+    local alpine_mirror
+    alpine_mirror=$(grep '^http.*/main$' /etc/apk/repositories | sed 's,/[^/]*/main$,,' | head -1)
+    apk add --repository "$alpine_mirror/edge/community" \
+        --force-non-repository \
+        --virtual edge \
+        "$@"
+}
+
+apk_del_edge() {
+    apk del edge
 }
 
 install_windows() {
@@ -5918,14 +6458,14 @@ install_windows() {
     if [ "$image_count" = 1 ]; then
         # 只有一个版本就用那个版本
         image_name=$all_image_names
-        image_index=1
+        iso_image_index=1
     else
         while true; do
             # 匹配成功
             # 改成正确的大小写
             if matched_image_name=$(printf '%s\n' "$all_image_names" | grep -Fix "$image_name"); then
                 image_name=$matched_image_name
-                image_index=$(wiminfo "$iso_install_wim" "$image_name" | grep 'Index:' | awk '{print $NF}')
+                iso_image_index=$(wiminfo "$iso_install_wim" "$image_name" | grep 'Index:' | awk '{print $NF}')
                 break
             fi
 
@@ -5946,54 +6486,35 @@ install_windows() {
     fi
 
     get_selected_image_prop() {
-        get_image_prop "$iso_install_wim" "$image_index" "$1"
+        get_image_prop "$iso_install_wim" "$iso_image_index" "$1"
     }
 
-    # 多会话的信息来自注册表，因为没有官方 iso
-
-    # Installation Type:
-    # https://github.com/search?q=InstallationType+Client+Embedded+Server+Core&type=code
-    # - Client      (普通 windows)
-    # - Server      (windows server 带桌面体验)
-    # - Server Core (windows server 不带桌面体验)
-    # - Embedded    (WES7 / Thin PC)
-    # - Client      (windows 10/11 enterprise 多会话)
-
-    # Product Type:
+    # Windows Server 作为域服务器时，ProductType 会变成 LanmanNT ?
     # https://cloud.tencent.com/developer/article/2465206
-    # https://learn.microsoft.com/en-us/azure/virtual-desktop/windows-multisession-faq#why-does-my-application-report-windows-enterprise-multi-session-as-a-server-operating-system
-    # - WinNT    (普通 windows)
-    # - ServerNT (windows server 带桌面体验)
-    # - ServerNT (windows server 不带桌面体验)
-    # - WinNT    (WES7 / Thin PC)
-    # - ServerNT (windows 10/11 enterprise 多会话)
+    # https://github.com/search?q=InstallationType+Client+Embedded+Server+Core&type=code
+    # https://learn.microsoft.com/azure/virtual-desktop/windows-multisession-faq#why-does-my-application-report-windows-enterprise-multi-session-as-a-server-operating-system
 
-    # Product Suite:
-    # https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/ex/exinit/productsuite.htm
-    # - Terminal Server (普通 windows)
-    # - Enterprise      (windows server 2025 带桌面体验)
-    # - Enterprise      (windows server 2025 不带桌面体验)
-    # - Terminal Server (windows server 2012 R2 评估板 带桌面体验，注册表也是这个值)
-    # - Terminal Server (windows server 2022 R2 评估板 不带桌面体验，注册表也是这个值)
-    # - Terminal Server (WES7 / Thin PC)
-    # - ?               (windows 10/11 enterprise 多会话)
+    # 信息是从注册表获取，因为某些 install.wim 可能缺少属性
+    # Azure 上能使用 Windows 10/11 Enterprise 多会话
+    # HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\InstallationType
+    # HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\ProductOptions\ProductType
+    # HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\ProductOptions\ProductSuite
 
-    # 用内核版本号筛选驱动
-    # 使得可以安装 Hyper-V Server / Azure Stack HCI 等 Windows Server 变种
-    # 7601.24214.180801-1700.win7sp1_ldr_escrow_CLIENT_ULTIMATE_x64FRE_en-us.iso wim 没有 Installation Type
-    # Vista wim 和 注册表 都没有 InstallationType
-    if false; then
-        nt_ver=$(get_selected_image_prop "Major Version").$(get_selected_image_prop "Minor Version")
-        build_ver=$(get_selected_image_prop "Build")
-        installation_type=$(get_selected_image_prop "Installation Type")
-    fi
+    # 系统                                InstallationType    ProductType    ProductSuite
+    # Windows Client (普通 Windows)          Client             WinNT        Terminal Server
+    # Windows 10/11 Enterprise 多会话        Client             ServerNT     Terminal Server
+    # Windows Server 2012 R2 桌面体验        Server             ServerNT     Terminal Server 和 DataCenter (两行)
+    # Windows Server 2012 R2 不带桌面体验    Server Core        ServerNT     Terminal Server 和 DataCenter (两行)
+    # Windows Server 2025 桌面体验           Server             ServerNT     Enterprise
+    # Windows Server 2025 不带桌面体验       Server Core        ServerNT     Enterprise
+    # WES7 / Thin PC                         Embedded           WinNT        Terminal Server
 
     mount_iso_install_wim_to() {
         local dir=$1
 
         mkdir -p "$dir"
         # shellcheck disable=SC2046
-        wimmount "$iso_install_wim" "$image_index" "$dir" \
+        wimmount "$iso_install_wim" "$iso_image_index" "$dir" \
             $($is_swm && echo "--ref=$(dirname "$iso_install_wim")/$swm_ref")
     }
 
@@ -6008,13 +6529,9 @@ install_windows() {
     get_windows_version_from_windows_drive /wim
 
     # 检测 client/server，并转换成标准版 windows 名称
+    # 用于将 Hyper-V Server / Azure Stack HCI / Windows Server AC 的版本号转换成对应的 LTSC 版本号，用于查找驱动
     windows_type=$(get_windows_type_from_windows_drive /wim)
-    product_ver=$(
-        case "$windows_type" in
-        client) get_client_name_by_build_ver "$build_ver" ;;
-        server) get_server_name_by_build_ver "$build_ver" ;;
-        esac
-    )
+    product_ver=$(get_windows_name_by_version "$nt_ver" "$build_ver" "$windows_type")
 
     # 检测 sac 和 nvme
     {
@@ -6173,21 +6690,24 @@ install_windows() {
         )
     fi
 
+    # $iso_image_index 是原 iso 里面的镜像 wim 编号
+    # $image_index 是复制到 installer 后的镜像 wim 编号
+
     # 如果是 swm，要先合并成 wim 才能编辑
     if $is_swm; then
         install_wim=$(echo "$install_wim" | sed 's/\.swm$/.wim/i')
         # 防止不格盘二次运行时报错：文件已存在
         rm -f "$install_wim"
-        wimexport --ref="$(dirname "$iso_install_wim")/$swm_ref" "$iso_install_wim" "$image_index" "$install_wim"
-        # 只导出了要安装的镜像，因此 image_index 变为 1
+        wimexport --ref="$(dirname "$iso_install_wim")/$swm_ref" "$iso_install_wim" "$iso_image_index" "$install_wim"
+        # 只导出了要安装的镜像，因此 image_index 为 1
         image_index=1
     elif false; then
         # 优化 install.wim
         # 优点: 可以节省 200M~600M 空间，用来创建虚拟内存
         #       （意义不大，因为已经删除了 boot.wim 用来创建虚拟内存，vista 除外）
         # 缺点: 如果 install.wim 只有一个镜像，则只能缩小 10M+
-        time wimexport --threads "$(get_build_threads 512)" "$iso_install_wim" "$image_index" "$install_wim"
-        # 只导出了要安装的镜像，因此 image_index 变为 1
+        time wimexport --threads "$(get_build_threads 512)" "$iso_install_wim" "$iso_image_index" "$install_wim"
+        # 只导出了要安装的镜像，因此 image_index 为 1
         image_index=1
         info "install.wim size"
         echo "Original:  $(get_filesize_mb "$iso_install_wim")"
@@ -6195,14 +6715,25 @@ install_windows() {
         echo
     else
         cp "$iso_install_wim" "$install_wim"
+        image_index="$iso_image_index"
     fi
 
     # win11 要求 1GHz 2核（1核超线程也行）
-    # 用注册表无法绕过
+    # 判断条件是 install.wim 元信息里的 Installation Type，而不是 install.wim 注册表里面的
+    # 7601.24214.180801-1700.win7sp1_ldr_escrow_CLIENT_ULTIMATE_x64FRE_en-us.iso wim 没有 Installation Type
+    # Vista wim 和 注册表 都没有 InstallationType
+    installation_type_from_install_wim_metadata=$(get_selected_image_prop "Installation Type" 2>/dev/null || true)
+
+    # 安装时无法用注册表绕过
     # https://github.com/pbatard/rufus/issues/1990
     # https://learn.microsoft.com/windows/iot/iot-enterprise/Hardware/System_Requirements
     # win11 旧版本安装程序（24h2之前）无法用 setup.exe /product server 跳过 cpu 核数限制，因此在xml里解除限制
-    if [ "$product_ver" = "11" ] && [ "$(nproc)" -le 1 ]; then
+
+    # windows 11 multi-session 用注册表的信息识别成 server 2022 用于匹配驱动，"$product_ver" 是 2022 而不是 11
+    # 因此这里判断的条件不是 [ "$product_ver" = "11" ]
+    if [ "$build_ver" -ge 22000 ] &&
+        [ "$(echo "$installation_type_from_install_wim_metadata" | to_lower)" = "client" ] &&
+        [ "$(nproc)" -le 1 ]; then
         wiminfo "$install_wim" "$image_index" --image-property WINDOWS/INSTALLATIONTYPE=Server
     fi
 
@@ -6294,8 +6825,9 @@ install_windows() {
         # vmd
         # RST v17 不支持 vmd
         # RST v18 inf 要求 15063 或以上
-        # RST v19 inf 要求 15063 或以上
+        # RST v19 inf 要求 15063 或以上，包含 v18 全部硬件 id
         # RST v20 inf 要求 19041 或以上
+        # RST v21 inf 要求 19041 或以上
         if [ -d /sys/module/vmd ] && [ "$build_ver" -ge 15063 ] && [ "$arch_wim" = x86_64 ]; then
             add_driver_vmd
         fi
@@ -6406,7 +6938,8 @@ install_windows() {
         )
 
         # 注意 intel 禁止了 aria2 下载
-        download "$url" $drv/intel.zip
+        # 还使用了 aws waf，要用浏览器通过 js 获取 aws-waf-token cookie 才能下载
+        download_via_browser "$url" $drv/intel.zip
 
         # inf 可能是 UTF-16 LE？因此用 rg 搜索
         # 用 busybox unzip 解压 win10 驱动时，路径和文件名会粘在一起
@@ -6671,15 +7204,21 @@ EOF
         # 10 >>> w10
         # 2012 r2 >>> 2k12R2
         virtio_sys=$(
-            case "$(echo "$product_ver" | to_lower)" in
-            'vista') echo 2k8 ;; # 没有 vista 文件夹
-            *)
+            # 没有 vista 文件夹
+            if [ "$product_ver" = vista ]; then
+                echo 2k8
+
+            # 2k16 2k19 2k22 文件夹没有 arm64 驱动
+            elif { [ "$product_ver" = 2016 ] || [ "$product_ver" = 2019 ] || [ "$product_ver" = 2022 ]; } &&
+                [ "$arch_wim" = arm64 ]; then
+                echo w10
+
+            else
                 case "$windows_type" in
                 client) echo "w$product_ver" ;;
                 server) echo "$product_ver" | sed -E -e 's/ //' -e 's/^200?/2k/' -e 's/r2/R2/' ;;
                 esac
-                ;;
-            esac
+            fi
         )
 
         # win7-drivers 分支 win7 文件夹只有一次提交，也就是 173 全家桶
@@ -6719,13 +7258,34 @@ EOF
         # %RHELScsi.DeviceDesc% = rhelscsi_inst, PCI\VEN_1AF4&DEV_1004&SUBSYS_00081AF4&REV_00
         # %RHELScsi.DeviceDesc% = rhelscsi_inst, PCI\VEN_1AF4&DEV_1048&SUBSYS_11001AF4&REV_01
 
+        local baseurl=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads
+
         case "$nt_ver" in
         6.0 | 6.1) $support_sha256 &&
             dir=archive-virtio/virtio-win-0.1.187-1 ||
             dir=archive-virtio/virtio-win-0.1.173-9 ;;        # vista|w7|2k8|2k8R2
         6.2 | 6.3) dir=archive-virtio/virtio-win-0.1.215-2 ;; # w8|w8.1|2k12|2k12R2
-        *) dir=stable-virtio ;;
+        *)
+            # 先获取最新版本号，再下载
+            # 用 stable-virtio 的话国内镜像下载的可能是缓存的旧版
+
+            # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
+            # 路径是网页，可能会弹出 anubis 验证
+
+            # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/CHECKSUM
+            # 路径是文件，应该不会弹出 anubis 验证？
+            dir=$(wget --spider -S "$baseurl/stable-virtio/CHECKSUM" 2>&1 >/dev/null |
+                grep -E '^  Location: ' | grep -Ewo -m1 'archive-virtio/virtio-win-[^/]+')
+            # dir=stable-virtio
+            ;;
         esac
+
+        # 如果 dir 包含数字，则是从具体版本号文件夹下载，文件不会更新，可以使用国内镜像
+        if [[ "$dir" =~ [0-9] ]]; then
+            local can_use_cn_mirror=true
+        else
+            local can_use_cn_mirror=false
+        fi
 
         # vista|w7|2k8|2k8R2|arm64 要从 iso 获取驱动
         if [ "$nt_ver" = 6.0 ] || [ "$nt_ver" = 6.1 ] || [ "$arch_wim" = arm64 ]; then
@@ -6734,10 +7294,8 @@ EOF
             virtio_source=msi
         fi
 
-        baseurl=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads
-
         if [ "$virtio_source" = iso ]; then
-            download $baseurl/$dir/virtio-win.iso $drv/virtio.iso
+            download $baseurl/$dir/virtio-win.iso $drv/virtio.iso $can_use_cn_mirror
             mkdir -p $drv/virtio
             mount -o ro $drv/virtio.iso $drv/virtio
 
@@ -6750,13 +7308,13 @@ EOF
             fi
         else
             apk add 7zip file
-            download $baseurl/$dir/virtio-win-gt-$arch_xdd.msi $drv/virtio.msi
+            download $baseurl/$dir/virtio-win-gt-$arch_xdd.msi $drv/virtio.msi $can_use_cn_mirror
             match="FILE_*_${virtio_sys}_${arch}*"
             7z x $drv/virtio.msi -o$drv/virtio -i!$match -y -bb1
-
-            # 为没有后缀名的文件添加后缀名
             (
                 cd $drv/virtio
+
+                # 为没有后缀名的文件添加后缀名
                 echo "Recognizing file extension..."
                 for file in *"${virtio_sys}_${arch}"; do
                     recognized=false
@@ -6803,7 +7361,7 @@ EOF
         # https://mirrors.tencent.com/install/cts/windows/Drivers.zip
 
         apk add 7zip
-        download https://mirrors.tencent.com/install/windows/virtio_64_1.0.9.exe $drv/virtio.exe
+        download https://mirrors.tencent.com/install/windows/virtio_64_1.0.9.exe $drv/virtio.exe true
         exclude='$*' # 排除 $PLUGINSDIR
         override=u   # A(u)to rename all
         7z x $drv/virtio.exe -o$drv/qcloud/ -ao$override -x!$exclude
@@ -7015,13 +7573,7 @@ EOF
             to_system_hive="$(find_file_ignore_case /wim/Windows/System32/config/SYSTEM)"
             to_software_hive="$(find_file_ignore_case /wim/Windows/System32/config/SOFTWARE)"
 
-            # TODO: alpine 3.24 发布后删除
-            # hivex-perl 要从 edge/community 仓库下载
-            alpine_mirror=$(grep '^http.*/main$' /etc/apk/repositories | sed 's,/[^/]*/main$,,' | head -1)
-            apk add --repository "$alpine_mirror/edge/community" \
-                --force-non-repository \
-                --virtual edge \
-                hivex-perl
+            apk add hivex-perl
 
             # 获取当前生效的 wvpci.inf 文件
             # 得到 wvpci.inf_amd64_86afbe8940682d27 这样的文件名
@@ -7073,7 +7625,7 @@ EOF
 EOF
             hivexregedit --merge "$to_system_hive" "$reg"
 
-            apk del edge
+            apk del hivex-perl
         else
             error_and_exit "vpci driver not found."
         fi
@@ -7084,36 +7636,43 @@ EOF
     add_driver_vmd() {
         info "Add drivers: VMD"
 
-        # RST v20 不支持 11代 PCI\VEN_8086&DEV_9A0B
-        support_v19=false
-        support_v20=false
+        local id=
         for d in /sys/bus/pci/devices/*; do
-            vendor=$(cat "$d/vendor" 2>/dev/null)
-            device=$(cat "$d/device" 2>/dev/null)
-            if [ "$vendor" = "0x8086" ]; then
-                case "$device" in
-                "0x9a0b") support_v19=true && support_v20=false && break ;;
-                "0x467f") support_v19=true && support_v20=true && break ;;
-                "0xa77f") support_v19=true && support_v20=true && break ;;
-                "0x7d0b") support_v19=false && support_v20=true && break ;;
-                "0xad0b") support_v19=false && support_v20=true && break ;;
-                esac
+            if [ "$(cat "$d/vendor" 2>/dev/null)" = "0x8086" ] &&
+                device=$(sed 's/^0x//' "$d/device" 2>/dev/null); then
+
+                # v21
+                if [ "$build_ver" -ge 19041 ] &&
+                    [ "$device" = "b06f" ]; then
+                    id=920456
+                    break
+
+                # v20
+                elif [ "$build_ver" -ge 19041 ] &&
+                    { [ "$device" = "467f" ] ||
+                        [ "$device" = "a77f" ] ||
+                        [ "$device" = "7d0b" ] ||
+                        [ "$device" = "ad0b" ]; }; then
+                    id=849936
+                    break
+
+                # v19
+                elif [ "$build_ver" -ge 15063 ] &&
+                    { [ "$device" = "9a0b" ] ||
+                        [ "$device" = "467f" ] ||
+                        [ "$device" = "a77f" ]; }; then
+                    id=849933
+                    break
+                fi
             fi
         done
-
-        local id
-        if $support_v20 && [ "$build_ver" -ge 19041 ]; then
-            id=849936
-        elif $support_v19 && [ "$build_ver" -ge 15063 ]; then
-            id=849933
-        fi
 
         if [ -n "$id" ]; then
             local url
             url=$(get_intel_download_url "$id" "SetupRST\.exe")
 
             # 注意 intel 禁止了 aria2 下载
-            download $url $drv/SetupRST.exe
+            download_via_browser $url $drv/SetupRST.exe
             apk add 7zip
             7z x $drv/SetupRST.exe -o$drv/SetupRST -i!.text
             7z x $drv/SetupRST/.text -o$drv/vmd
@@ -7142,19 +7701,43 @@ EOF
     }
 
     # 修改应答文件
+    apk add xmlstarlet
     download $confhome/windows.xml /tmp/autounattend.xml
     locale=$(get_selected_image_prop 'Default Language')
     use_default_rdp_port=$(is_need_change_rdp_port && echo false || echo true)
-    password_base64=$(get_password_windows_administrator_base64)
+
     # 7601.24214.180801-1700.win7sp1_ldr_escrow_CLIENT_ULTIMATE_x64FRE_en-us.iso Image Name 为空
     # 将 xml Image Name 的值设为空可以正常安装
     sed -i \
         -e "s|%arch%|$arch|" \
         -e "s|%image_name%|$image_name|" \
         -e "s|%locale%|$locale|" \
-        -e "s|%administrator_password%|$password_base64|" \
         -e "s|%use_default_rdp_port%|$use_default_rdp_port|" \
         /tmp/autounattend.xml
+
+    # 账号密码
+    if is_administrator_username "$username"; then
+        # Administrator
+        password_base64=$(get_password_windows_administrator_base64)
+        xmlstarlet ed -L -N x="urn:schemas-microsoft-com:unattend" \
+            -d "//x:LocalAccounts" \
+            /tmp/autounattend.xml
+        sed -i \
+            -e "s|%enable_administrator%|1|gi" \
+            -e "s|%administrator_password%|$password_base64|gi" \
+            /tmp/autounattend.xml
+    else
+        # 普通账号
+        password_base64=$(get_password_windows_user_base64)
+        xmlstarlet ed -L -N x="urn:schemas-microsoft-com:unattend" \
+            -d "//x:AdministratorPassword" \
+            /tmp/autounattend.xml
+        sed -i \
+            -e "s|%enable_administrator%|0|gi" \
+            -e "s|%user_username%|$username|gi" \
+            -e "s|%user_password%|$password_base64|gi" \
+            /tmp/autounattend.xml
+    fi
 
     # 修改应答文件，分区配置
     if is_efi; then
@@ -7242,12 +7825,12 @@ EOF
     wim_windows_xml=$(get_path_in_correct_case /wim/windows.xml)
     wim_setup_exe=$(get_path_in_correct_case /wim/setup.exe)
 
-    apk add xmlstarlet
     xmlstarlet ed -d '//comment()' /tmp/autounattend.xml >$wim_autounattend_xml
     unix2dos $wim_autounattend_xml
     info "autounattend.xml"
     # 查看最终文件，并屏蔽密码
     xmlstarlet ed -d '//*[name()="AdministratorPassword" or name()="Password"]' $wim_autounattend_xml | cat -n
+
     apk del xmlstarlet
 
     # 避免无参数运行 setup.exe 时自动安装
@@ -7747,17 +8330,20 @@ mount / -o remount,size=100%
 sync_time || true
 
 # 安装 ssh 并更改端口
-apk add openssh
+apk add openssh-server
 if is_need_change_ssh_port; then
     change_ssh_port / $ssh_port
 fi
 
 # 设置密码，添加开机启动 + 开启 ssh 服务
+add_user_if_need /
 if is_need_set_ssh_keys; then
     set_ssh_keys_and_del_password /
+    change_ssh_conf_for_key_login /
     printf '\n' | setup-sshd
 else
-    change_root_password /
+    change_user_password /
+    change_ssh_conf_for_password_login /
     printf '\nyes' | setup-sshd
 fi
 
