@@ -7952,10 +7952,21 @@ EOF
         # 或者用 ms-sys
         apk add grub-bios
         # efi 下，强制安装 mbr 引导，需要添加 --target i386-pc
-        grub-install --target i386-pc --boot-directory="$(get_path_in_correct_case /os/boot)" /dev/$xda
-        cat <<EOF >"$(get_path_in_correct_case /os/boot/grub/grub.cfg)"
+        # 嵌入模块，避免 prefix 路径大小写不一致时进入 grub rescue
+        grub_modules="part_msdos ntfs search ntldr"
+        boot_dir_grub="$(get_path_in_correct_case /os/boot)"
+        grub_cfg="$(get_path_in_correct_case /os/boot/grub/grub.cfg)"
+        grub-install --target i386-pc \
+            --boot-directory="$boot_dir_grub" \
+            --install-modules="$grub_modules" \
+            /dev/$xda
+        cat <<EOF >"$grub_cfg"
             set timeout=5
             menuentry "reinstall" {
+                insmod part_msdos
+                insmod ntfs
+                insmod search
+                insmod ntldr
                 search --no-floppy --label --set=root os
                 ntldr /$(cd /os && get_path_in_correct_case bootmgr)
             }
