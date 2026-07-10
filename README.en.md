@@ -59,7 +59,7 @@ The system requirements for the target system are as follows:
 | <img width="16" height="16" src="https://fedoraproject.org/favicon.ico" /> Fedora                                                                                                                                                                                                                                                                                      | 43, 44                                | 512 MB \* | 5 GB             |
 | <img width="16" height="16" src="https://www.openeuler.org/favicon.ico" /> openEuler                                                                                                                                                                                                                                                                                   | 20.03 LTS - 24.03 LTS                 | 512 MB \* | 5 GB             |
 | <img width="16" height="16" src="https://static.opensuse.org/favicon.ico" /> openSUSE                                                                                                                                                                                                                                                                                  | Leap 16.0, Tumbleweed (Rolling)       | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://nixos.org/favicon.svg" /> NixOS                                                                                                                                                                                                                                                                                               | 25.11                                 | 512 MB    | 5 GB             |
+| <img width="16" height="16" src="https://nixos.org/favicon.svg" /> NixOS                                                                                                                                                                                                                                                                                               | 26.05                                 | 512 MB    | 5 GB             |
 | <img width="16" height="16" src="https://archlinux.org/static/favicon.png" /> Arch                                                                                                                                                                                                                                                                                     | Rolling                               | 512 MB    | 5 GB             |
 | <img width="16" height="16" src="https://www.gentoo.org/assets/img/logo/gentoo-g.png" /> Gentoo                                                                                                                                                                                                                                                                        | Rolling                               | 512 MB    | 5 GB             |
 | <img width="16" height="16" src="https://aosc.io/distros/aosc-os.svg" /> AOSC OS                                                                                                                                                                                                                                                                                       | Rolling                               | 512 MB    | 5 GB             |
@@ -164,7 +164,7 @@ bash reinstall.sh anolis      7|8|23
                   centos      9|10
                   fnos        1
                   fygoos      1
-                  nixos       25.11
+                  nixos       26.05
                   fedora      43|44
                   debian      9|10|11|12|13
                   opensuse    16.0|tumbleweed
@@ -199,7 +199,7 @@ bash reinstall.sh anolis      7|8|23
 
 <details>
 
-<summary>Experimental Features</summary>
+<summary>Deprecated Features</summary>
 
 Install Debian using a cloud image
 
@@ -212,16 +212,19 @@ bash reinstall.sh debian --ci
 Install CentOS, AlmaLinux, Rocky, Fedora using ISO
 
 - Only supports machines with more than 2G of memory and dynamic IP.
-- Password is `123@@@`, and the SSH port is `22`; modifying them using parameters is not supported.
+- Username is `root`, Password is `123@@@`, and the SSH port is `22`; modifying them using parameters is not supported.
 
 ```bash
 bash reinstall.sh centos --installer
+bash reinstall.sh almalinux --installer
+bash reinstall.sh rocky --installer
+bash reinstall.sh fedora --installer
 ```
 
 Install Ubuntu using ISO
 
 - Only supports machines with more than 1G of memory and dynamic IP.
-- Password is `123@@@`, and the SSH port is `22`; modifying them using parameters is not supported.
+- Username is `root`, Password is `123@@@`, and the SSH port is `22`; modifying them using parameters is not supported.
 
 ```bash
 bash reinstall.sh ubuntu --installer
