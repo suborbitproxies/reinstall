@@ -8034,7 +8034,16 @@ EOF
     mkdir -p "$(get_path_in_correct_case "$(dirname $boot_dir/$sources_boot_wim)")"
     # 防止不格盘二次运行时报错：文件已存在
     rm -f $boot_dir/$sources_boot_wim
-    wimexport --boot /os/boot.wim "$images" $boot_dir/$sources_boot_wim
+    # wimlib 直接写到 vfat 可能卡住（I/O 停在几十 MB），先导出到 NTFS 再复制到 efi
+    if is_efi; then
+        wim_export_tmp=/os/boot.wim.export
+        rm -f "$wim_export_tmp"
+        wimexport --boot /os/boot.wim "$images" "$wim_export_tmp"
+        cp -f "$wim_export_tmp" $boot_dir/$sources_boot_wim
+        rm -f "$wim_export_tmp"
+    else
+        wimexport --boot /os/boot.wim "$images" $boot_dir/$sources_boot_wim
+    fi
     info "boot.wim size"
     echo "Original:      $(get_filesize_mb /iso/$sources_boot_wim)"
     echo "Added Drivers: $(get_filesize_mb /os/boot.wim)"
